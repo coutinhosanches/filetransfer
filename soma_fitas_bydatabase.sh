@@ -2,10 +2,6 @@
 #
 # soma_fitas_db.sh
 #
-# Executa:
-#   1. obtool lsvol --barcode <BARCODES> --contents
-#   2. obtool lspiece --vid <VID> --section --long
-#
 # Consolida a ocupação por Fita (Barcode) e Banco de Dados (Database).
 
 set -u
@@ -69,43 +65,40 @@ if [[ -z "$LSVOL_OUT" ]]; then
     exit 1
 fi
 
-# Extrai os Volume IDs (VID) encontrados no lsvol para buscar no lspiece
+# Extrai os Volume IDs (VID) encontrados no lsvol
 VIDS="$(printf '%s\n' "$LSVOL_OUT" | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 !~ /^[0-9]+$/ {print $4}' | sort -u)"
 
-# 2. Obter o mapeamento BSOID -> Database para cada VID
-LSPIECE_OUT=""
+# Arquivo temporário para salvar a saída do lspiece (evita estouro de argumento do kernel)
+TMP_LSPIECE="$(mktemp)"
+trap 'rm -f "$TMP_LSPIECE"' EXIT
+
+# 2. Obter o mapeamento BSOID -> Database salvando direto no arquivo temporário
 for vid in $VIDS; do
-    piece_data="$(obtool lspiece --vid "$vid" --section --long 2>/dev/null)"
-    if [[ -n "$piece_data" ]]; then
-        LSPIECE_OUT="${LSPIECE_OUT}"$'\n'"${piece_data}"
-    fi
+    obtool lspiece --vid "$vid" --section --long 2>/dev/null >> "$TMP_LSPIECE"
 done
 
-# 3. Processar dados integrados via AWK
-awk -v lspiece_data="$LSPIECE_OUT" '
-BEGIN {
-    # Mapeia BSOID -> Database a partir dos dados do lspiece
-    split(lspiece_data, lines, "\n")
-    curr_db = "DESCONHECIDO"
-    
-    for (i in lines) {
-        line = lines[i]
-        
-        if (line ~ /^[[:space:]]*Database:[[:space:]]*/) {
-            sub(/^[[:space:]]*Database:[[:space:]]*/, "", line)
-            gsub(/[[:space:]]+$/, "", line)
-            curr_db = line
-        }
-        else if (line ~ /^[[:space:]]*BSOID:[[:space:]]*/) {
-            sub(/^[[:space:]]*BSOID:[[:space:]]*/, "", line)
-            gsub(/[[:space:]]+$/, "", line)
-            bsoid = line
-            if (bsoid != "") {
-                bsoid_to_db[bsoid] = curr_db
-            }
+# 3. Processar os dois fluxos de dados via AWK usando dois arquivos de entrada
+awk '
+# Arquivo 1: Mapeamento vindo do TMP_LSPIECE
+NR == FILENAME {
+    if ($0 ~ /^[[:space:]]*Database:[[:space:]]*/) {
+        curr_db = $0
+        sub(/^[[:space:]]*Database:[[:space:]]*/, "", curr_db)
+        gsub(/[[:space:]]+$/, "", curr_db)
+    }
+    else if ($0 ~ /^[[:space:]]*BSOID:[[:space:]]*/) {
+        bsoid = $0
+        sub(/^[[:space:]]*BSOID:[[:space:]]*/, "", bsoid)
+        gsub(/[[:space:]]+$/, "", bsoid)
+        if (bsoid != "") {
+            bsoid_to_db[bsoid] = curr_db
         }
     }
+    next
+}
 
+# Arquivo 2: Processamento do LSVOL_OUT
+BEGIN {
     current_tape = ""
 }
 
@@ -173,4 +166,4 @@ END {
            "TOTAL GERAL", "-", grand_objs, grand_bytes / 1024^3, grand_bytes / 1024^4
     print "=========================================================================="
 }
-' <<< "$LSVOL_OUT"
+' "$TMP_LSPIECE" - <<< "$LSVOL_OUT"
