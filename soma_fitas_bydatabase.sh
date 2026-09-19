@@ -2,7 +2,7 @@
 #
 # soma_fitas_db.sh
 #
-# Consolida a ocupação por Fita (Barcode) e Banco de Dados (Database).
+# Consolida a ocupação por Banco de Dados (Database) e Fita (Barcode).
 
 set -u
 set -o pipefail
@@ -58,14 +58,12 @@ echo "==========================================================================
 echo " Coletando informações de volumes e peças de backup..."
 echo "=========================================================================="
 
-# Criar arquivos temporários para ambos os comandos
 TMP_LSVOL="$(mktemp)"
 TMP_LSPIECE="$(mktemp)"
 
-# Garantir a remoção dos arquivos temporários ao sair do script
 trap 'rm -f "$TMP_LSVOL" "$TMP_LSPIECE"' EXIT
 
-# 1. Executa obtool lsvol e grava direto no arquivo
+# 1. Executa obtool lsvol
 obtool lsvol --barcode "$BARCODES" --contents > "$TMP_LSVOL" 2>/dev/null
 
 if [[ ! -s "$TMP_LSVOL" ]]; then
@@ -73,17 +71,16 @@ if [[ ! -s "$TMP_LSVOL" ]]; then
     exit 1
 fi
 
-# Extrai os Volume IDs (VID) encontrados no lsvol
+# Extrai os Volume IDs (VID)
 VIDS="$(awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 !~ /^[0-9]+$/ {print $4}' "$TMP_LSVOL" | sort -u)"
 
-# 2. Executa o lspiece salvando direto no arquivo temporário
+# 2. Executa obtool lspiece
 for vid in $VIDS; do
     obtool lspiece --vid "$vid" --section --long >> "$TMP_LSPIECE" 2>/dev/null
 done
 
-# 3. Processa os dois arquivos sequencialmente no AWK
+# 3. Processa e gera saída formatada para ordenação
 awk '
-# Trecho 1: Processa o arquivo TMP_LSPIECE
 FILENAME == ARGV[1] {
     if ($0 ~ /^[[:space:]]*Database:[[:space:]]*/) {
         curr_db = $0
@@ -101,14 +98,11 @@ FILENAME == ARGV[1] {
     next
 }
 
-# Trecho 2: Processa o arquivo TMP_LSVOL
-# Identifica o cabeçalho do Volume/Fita
 $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 !~ /^[0-9]+$/ && $5 !~ /^[0-9]+$/ {
     current_tape = $5
     next
 }
 
-# Identifica linha de conteúdo (peça)
 $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $6 ~ /^[0-9]+([.,][0-9]+)?$/ {
     bsoid = $1
     value = $6
@@ -125,45 +119,69 @@ $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $6 ~
 
     db_name = (bsoid in bsoid_to_db) ? bsoid_to_db[bsoid] : "OUTROS/SISTEMA"
 
-    # Acumula por Fita + Database
-    tape_db_bytes[current_tape, db_name] += bytes
-    tape_db_objs[current_tape, db_name]++
+    db_tape_bytes[db_name, current_tape] += bytes
+    db_tape_objs[db_name, current_tape]++
 
-    # Acumula total por Fita
-    tape_bytes[current_tape] += bytes
-    tape_objs[current_tape]++
-
-    # Acumula Total Geral
     grand_bytes += bytes
     grand_objs++
 
-    tapes[current_tape] = 1
     dbs[db_name] = 1
+    tapes[current_tape] = 1
 }
 
 END {
-    printf "\n%-15s %-20s %10s %14s %12s\n", "BARCODE", "DATABASE", "OBJETOS", "GB", "TB"
-    print "--------------------------------------------------------------------------"
-
-    for (t in tapes) {
-        for (d in dbs) {
-            if ((t, d) in tape_db_bytes) {
-                printf "%-15s %-20s %10d %14.2f %12.2f\n",
-                       t,
+    for (d in dbs) {
+        for (t in tapes) {
+            if ((d, t) in db_tape_bytes) {
+                # Imprime linhas brutas delimitadas por ponto e vírgula para fácil ordenação
+                printf "%s;%s;%d;%.2f;%.2f\n",
                        d,
-                       tape_db_objs[t, d],
-                       tape_db_bytes[t, d] / 1024^3,
-                       tape_db_bytes[t, d] / 1024^4
+                       t,
+                       db_tape_objs[d, t],
+                       db_tape_bytes[d, t] / 1024^3,
+                       db_tape_bytes[d, t] / 1024^4
             }
         }
-        print "--------------------------------------------------------------------------"
-        printf "%-15s %-20s %10d %14.2f %12.2f\n",
-               t, "SUBTOTAL", tape_objs[t], tape_bytes[t] / 1024^3, tape_bytes[t] / 1024^4
+    }
+    # Imprime Total Geral na última linha com prefixo especial
+    printf "___TOTAL___;-;%d;%.2f;%.2f\n", grand_objs, grand_bytes / 1024^3, grand_bytes / 1024^4
+}
+' "$TMP_LSPIECE" "$TMP_LSVOL" | sort -t';' -k1,1 -k2,2 | awk -F';' '
+BEGIN {
+    printf "\n%-20s %-15s %10s %14s %12s\n", "DATABASE", "BARCODE", "OBJETOS", "GB", "TB"
+    print "--------------------------------------------------------------------------"
+    curr_db = ""
+    db_objs = 0
+    db_bytes_gb = 0
+    db_bytes_tb = 0
+}
+
+{
+    if ($1 == "___TOTAL___") {
+        if (curr_db != "") {
+            print "--------------------------------------------------------------------------"
+            printf "%-20s %-15s %10d %14.2f %12.2f\n", curr_db, "SUBTOTAL", db_objs, db_bytes_gb, db_bytes_tb
+            print "=========================================================================="
+        }
+        printf "%-20s %-15s %10d %14.2f %12.2f\n", "TOTAL GERAL", "-", $3, $4, $5
         print "=========================================================================="
+        next
     }
 
-    printf "%-15s %-20s %10d %14.2f %12.2f\n",
-           "TOTAL GERAL", "-", grand_objs, grand_bytes / 1024^3, grand_bytes / 1024^4
-    print "=========================================================================="
+    if (curr_db != "" && curr_db != $1) {
+        print "--------------------------------------------------------------------------"
+        printf "%-20s %-15s %10d %14.2f %12.2f\n", curr_db, "SUBTOTAL", db_objs, db_bytes_gb, db_bytes_tb
+        print "=========================================================================="
+        db_objs = 0
+        db_bytes_gb = 0
+        db_bytes_tb = 0
+    }
+
+    curr_db = $1
+    db_objs += $3
+    db_bytes_gb += $4
+    db_bytes_tb += $5
+
+    printf "%-20s %-15s %10d %14.2f %12.2f\n", $1, $2, $3, $4, $5
 }
-' "$TMP_LSPIECE" "$TMP_LSVOL"
+'
