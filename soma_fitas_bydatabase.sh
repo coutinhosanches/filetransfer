@@ -58,29 +58,33 @@ echo "==========================================================================
 echo " Coletando informações de volumes e peças de backup..."
 echo "=========================================================================="
 
-# 1. Obter a saída do lsvol (conteúdo das fitas)
-LSVOL_OUT="$(obtool lsvol --barcode "$BARCODES" --contents 2>/dev/null)"
-if [[ -z "$LSVOL_OUT" ]]; then
+# Criar arquivos temporários para ambos os comandos
+TMP_LSVOL="$(mktemp)"
+TMP_LSPIECE="$(mktemp)"
+
+# Garantir a remoção dos arquivos temporários ao sair do script
+trap 'rm -f "$TMP_LSVOL" "$TMP_LSPIECE"' EXIT
+
+# 1. Executa obtool lsvol e grava direto no arquivo
+obtool lsvol --barcode "$BARCODES" --contents > "$TMP_LSVOL" 2>/dev/null
+
+if [[ ! -s "$TMP_LSVOL" ]]; then
     echo "ERRO: Nenhum dado retornado pelo obtool lsvol." >&2
     exit 1
 fi
 
 # Extrai os Volume IDs (VID) encontrados no lsvol
-VIDS="$(printf '%s\n' "$LSVOL_OUT" | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 !~ /^[0-9]+$/ {print $4}' | sort -u)"
+VIDS="$(awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 !~ /^[0-9]+$/ {print $4}' "$TMP_LSVOL" | sort -u)"
 
-# Arquivo temporário para salvar a saída do lspiece (evita estouro de argumento do kernel)
-TMP_LSPIECE="$(mktemp)"
-trap 'rm -f "$TMP_LSPIECE"' EXIT
-
-# 2. Obter o mapeamento BSOID -> Database salvando direto no arquivo temporário
+# 2. Executa o lspiece salvando direto no arquivo temporário
 for vid in $VIDS; do
-    obtool lspiece --vid "$vid" --section --long 2>/dev/null >> "$TMP_LSPIECE"
+    obtool lspiece --vid "$vid" --section --long >> "$TMP_LSPIECE" 2>/dev/null
 done
 
-# 3. Processar os dois fluxos de dados via AWK usando dois arquivos de entrada
+# 3. Processa os dois arquivos sequencialmente no AWK
 awk '
-# Arquivo 1: Mapeamento vindo do TMP_LSPIECE
-NR == FILENAME {
+# Trecho 1: Processa o arquivo TMP_LSPIECE
+FILENAME == ARGV[1] {
     if ($0 ~ /^[[:space:]]*Database:[[:space:]]*/) {
         curr_db = $0
         sub(/^[[:space:]]*Database:[[:space:]]*/, "", curr_db)
@@ -97,11 +101,7 @@ NR == FILENAME {
     next
 }
 
-# Arquivo 2: Processamento do LSVOL_OUT
-BEGIN {
-    current_tape = ""
-}
-
+# Trecho 2: Processa o arquivo TMP_LSVOL
 # Identifica o cabeçalho do Volume/Fita
 $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 !~ /^[0-9]+$/ && $5 !~ /^[0-9]+$/ {
     current_tape = $5
@@ -166,4 +166,4 @@ END {
            "TOTAL GERAL", "-", grand_objs, grand_bytes / 1024^3, grand_bytes / 1024^4
     print "=========================================================================="
 }
-' "$TMP_LSPIECE" - <<< "$LSVOL_OUT"
+' "$TMP_LSPIECE" "$TMP_LSVOL"
